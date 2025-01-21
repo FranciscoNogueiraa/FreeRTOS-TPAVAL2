@@ -7,7 +7,7 @@ SEEV - Sistemas Elétricos e Eletrónicos de Veículos
 
 TP2: Pretende-se com este trabalho a implementação de código em Arduino/FreeRTOS capaz de gerir um quadrante automóvel com diversas funcionalidades integradas
 
-LINK: (link do código do github gist).
+LINK: https://youtube.com/shorts/DE51vCpgxNU?feature=share.
 
 #include <Adafruit_GFX.h> 
 
