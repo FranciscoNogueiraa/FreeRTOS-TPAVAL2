@@ -1,0 +1,972 @@
+Nome ALUNO A- Francisco Rodrigues Nogueira
+Nome ALUNO B- David Ferrreira Vale
+IPLEIRIA - Instituto Politécnico de Leiria
+ESTG - Escola Superior de Tecnologia e Gestão
+LEAU- Licenciatura em Engenharia Automóvel
+SEEV - Sistemas Elétricos e Eletrónicos de Veículos
+
+TP2: Pretende-se com este trabalho a implementação de código em Arduino/FreeRTOS capaz de gerir um quadrante automóvel com diversas funcionalidades integradas
+
+LINK: (link do código do github gist).
+
+#include <Adafruit_GFX.h> 
+
+#include <Adafruit_ILI9341.h> 
+
+#include <freertos/FreeRTOS.h> 
+
+#include <freertos/task.h> 
+
+#include <freertos/queue.h> 
+
+#include <freertos/semphr.h> 
+
+#include <Adafruit_Sensor.h> 
+
+#include <DHT.h> 
+
+#include <DHT_U.h> 
+
+ 
+
+ 
+
+#define TFT_CS 5       		// pino tft 
+
+#define TFT_RST 4		// pino tft 
+
+#define TFT_DC 2		// pino tft 
+
+#define DHTPIN 22		// pino sensor de temperatura 
+
+#define DHTTYPE DHT11		//tipo de sensor de temperatura 
+
+ 
+
+ 
+
+Adafruit_ILI9341 tft = Adafruit_ILI9341(TFT_CS, TFT_DC, TFT_RST); 		//configurações do display 
+
+DHT dht(DHTPIN, DHTTYPE);	//configurações do sensor de temperatura 
+
+ 
+
+struct SensorData {	// estutura dos dados recolhidos por sensores 
+
+ 
+
+    int temperature; 
+
+    int rpm; 
+
+    int switch1State;		// estado do botão 1 
+
+    int switch2State;		// estado do botão 2 
+
+    int distance1;		// distância do SU1 
+
+    int distance2;		// distância do SU2 
+
+    int distance3;		// distância do SU3 
+
+}; 
+
+ 
+
+struct ProcessedData {	// estutura dos dados processados pela lógica 
+
+    int gear; 
+
+    int rpm; 
+
+    int temperature; 
+
+    int distance1; 
+
+    int distance2; 
+
+    int distance3; 
+
+       int simulatedVelocity; 
+
+       int messageStartTime; 
+
+}; 
+
+ 
+
+ 
+
+QueueHandle_t sensorDataQueue;		// definição da queue referente aos dados recolhidos por sensores 
+
+QueueHandle_t processedDataQueue;		// definição da queue referente aos dados processados 
+
+SemaphoreHandle_t displaySemaphore;  		// definição do semáforo do display 
+
+SemaphoreHandle_t sensorSemaphore;  		// definição do semáforo dos sensores 
+
+SemaphoreHandle_t reverseGearSemaphore;  		// definição do semáforo de bloqueio da marcha-atrás 
+
+SemaphoreHandle_t logicSemaphore; 
+
+ 
+
+int previousTemperature = -1;		// definição da variável 
+
+int previousRPM = -1;		// definição da variável 
+
+bool showMessage = false;  		// definição da variável de controlo da mostra da mensagem de bloqueio/aviso 
+
+ 
+
+long leituraSensoresUltrassons(int triggerPin, int echoPin) {  // função genérica de leitura dos sensores deultrassons 
+
+    digitalWrite(triggerPin, LOW);		// sinal LOW no pino trigger 
+
+    delayMicroseconds(2);		// delay para correta leitura da distância 
+
+    digitalWrite(triggerPin, HIGH);		// sinal HIGH no pino trigger 
+
+    delayMicroseconds(10);		// delay para correta leitura da distância 
+
+    digitalWrite(triggerPin, LOW);		// sinal LOW no pino trigger 
+
+ 
+
+    long duration = pulseIn(echoPin, HIGH);		// cáclulo da duração do pulso a ir e voltar 
+
+    long distance = (duration / 2) * 0.0344; 		// cáclulo da distância do objeto em função da duração do pulso 
+
+    return distance;		// devolução da distância 
+
+} 
+
+ 
+
+ 
+
+int leituraTemperatura() {		// função genérica de leitura da temperatura 
+
+    int temp;		// inicialização da variável da temperatura 
+
+    for (int i = 0; i < 5; i++) { 		// ciclo onde será lida a temperatura 
+
+        temp = dht.readTemperature() + 75; 		// leitura do sensor de temperatura e ajuste do offset para simulação 
+
+        if (!isnan(temp)) {	// correção/proteção do valor face a este por vezes flutuar de forma errática 
+
+ 
+
+            if (temp < 0) temp = 0; 
+
+            if (temp > 100) temp = 100; 
+
+            return temp;	// devolução da temperatura 
+
+        } 
+
+        delay(100); 	// espaçamento entre tantativas de leitura do sensor 
+
+    } 
+
+    return -1; 
+
+} 
+
+ 
+
+ 
+
+void desenhaLayout() {		// função que cria o layout genérico do display 
+
+#define RPM_LIMIT 6500   		// threshold das rpms 
+
+tft.setTextColor(ILI9341_WHITE, ILI9341_BLACK);		// definição da cor do texto 
+
+tft.setTextSize(2);		// definição do tamanho do texto 
+
+tft.setCursor(10, 55);		// definição da posição do cursor 
+
+ tft.print("RPM:");		// escrita no display 
+
+ tft.setCursor(10, 120);		// definição da posição do cursor 
+
+    tft.print("TEMP:");		// escrita no display 
+
+    tft.setCursor(10, 190);		// definição da posição do cursor 
+
+    tft.print("Gear:");		// escrita no display 
+
+ 
+
+ 
+
+    int circleX = 20, circleY = 15, circleRadius = 5, numCircles = 10;	// desenho inicial da barra de leds 
+
+    for (int i = 0; i < numCircles; i++) {		// ciclo para a barra de leds 
+
+        tft.fillCircle(circleX, circleY, circleRadius, ILI9341_DARKGREY); 	// leds desligados/cinzentos por defeito 
+
+        circleX += 20;	// incrementador para incidir sobre cada led 
+
+    } 
+
+ 
+
+ 
+
+    int barX1 = 150, barX2 = barX1 + 40, barY = 75, barHeight = 200;		// definição de pontos para criação das barras de rpm e temp 
+
+    tft.fillRect(barX1, barY, 30, barHeight, ILI9341_BLUE);				// criação da barra temperatura 
+
+    tft.fillRect(barX2, barY, 30, barHeight, ILI9341_BLUE);				// criação da barra rpm 
+
+} 
+
+ 
+
+void barraLEDs(int rpm) {	// função de atualização da barra de leds 
+
+#define RPM_LIMIT 6500   	// threshold das rpms 
+
+   int numCircles = 10;	// número de leds 
+
+   int circleX = 20, circleY = 15, circleRadius = 5;		// tamanho dos círculos 
+
+ 
+
+ 
+
+    int activeCircles = map(rpm, 0, RPM_LIMIT, 0, numCircles);		// cálculo do número de leds a acender com base no tamanho da barra rpm 
+
+ 
+
+    for (int i = 0; i < numCircles; i++) {   			// ciclo para acender os leds necessários 
+
+        uint16_t color;		// variável da cor do led 
+
+        if (i < activeCircles) {	// ciclo de atribuição da cor correta a cada led 
+
+            if (i < 4) { 
+
+                color = ILI9341_GREEN; 
+
+            } else if (i < 7) { 
+
+                color = ILI9341_CYAN; 
+
+            } else { 
+
+                color = ILI9341_BLUE; 
+
+            } 
+
+        } else { 
+
+            color = ILI9341_DARKGREY; 	// leds desligados mantêm a cor default 
+
+        } 
+
+ 
+
+        tft.fillCircle(circleX, circleY, circleRadius, color);		// cada led acende no sítio que lhe corresponde com a cor que lhe corresponde 
+
+        circleX += 20;	// espaçamento entre cada led 
+
+    } 
+
+} 
+
+ 
+
+ 
+
+void TaskSensores(void *pvParameters) {		// task referente aos sensores 
+
+#define RPM_LIMIT 6500   			// threshold das rpms 
+
+#define SW1 25		// pino do botão 1 
+
+#define SW2 33		// pino do botão 2 
+
+#define TRIGGER_PIN1 12		// pino do sensor ultrassónico 1 
+
+#define ECHO_PIN1 14		// pino do sensor ultrassónico 1 
+
+#define TRIGGER_PIN2 27 		// pino do sensor ultrassónico 2 
+
+#define ECHO_PIN2 26		// pino do sensor ultrassónico 2 
+
+#define TRIGGER_PIN3 16		// pino do sensor ultrassónico 3 
+
+#define ECHO_PIN3 17 		// pino do sensor ultrassónico 3 
+
+#define POTENCIOMETRO_PIN 39  		// Pino do potenciómetro 
+
+SensorData sensorData;		// inicialização da variável/estrutura de dados dos sensores 
+
+    ProcessedData ProcessedData;		// inicialização da variável/estrutura de dados processados 
+
+    for (;;) {	// ciclo principal da tarefa 
+
+ 
+
+        sensorData.temperature = leituraTemperatura();				// aquisição do valor do sensor de temperatura através da função 
+
+        int potValue = analogRead(POTENCIOMETRO_PIN);				// aquisição do valor da rpm através da leitura do valor do potenciómetro 
+
+        sensorData.rpm = map(potValue, 0, 4095, 0, RPM_LIMIT);		// conversão do valor do potenciómetro na rpm correspondente 
+
+ 
+
+        sensorData.switch1State = digitalRead(SW1);		// leitura do botão 1 
+
+        sensorData.switch2State = digitalRead(SW2);		// leitura do botão 2 
+
+ 
+
+        sensorData.distance1 = leituraSensoresUltrassons(TRIGGER_PIN1, ECHO_PIN1); 	// leitura do sensor de ultrassons 1 
+
+        sensorData.distance2 = leituraSensoresUltrassons(TRIGGER_PIN2, ECHO_PIN2);		// leitura do sensor de ultrassons 2 
+
+        sensorData.distance3 = leituraSensoresUltrassons(TRIGGER_PIN3, ECHO_PIN3);		// leitura do sensor de ultrassons 3 
+
+ 
+
+ 
+
+        if (xSemaphoreTake(sensorSemaphore, portMAX_DELAY)) {	// take do semáforo referente aos sensores 
+
+ 
+
+            if (xQueueSend(sensorDataQueue, &sensorData, pdMS_TO_TICKS(200)) != pdTRUE) {		// envio dos dados dos sensores para a respetiva queue 
+
+                Serial.println("Sensor Queue is full or failed to send data"); 
+
+            } 
+
+            xSemaphoreGive(sensorSemaphore);		// give do semáforo referente aos sensores 
+
+        } 
+
+        vTaskDelay(pdMS_TO_TICKS(200)); 		// frequência da tarefa 
+
+    } 
+
+} 
+
+ 
+
+ 
+
+void TaskLogica(void *pvParameters) {	// tarefa que efetua a lógica do projeto 
+
+    SensorData sensorData;							// inicialização da variável/estrutura de dados dos sensores 
+
+    ProcessedData processedData;	// inicialização da variável/estrutura de dados processados 
+
+    processedData.gear = 0; 	// inicialização da caixa de velocidades em Neutro 
+
+#define TEMP_LIMIT 90	// threshold da temperatura 
+
+#define RPM_LIMIT 6500   	// threshold das rpms 
+
+    #define MESSAGE_DURATION 2000  	// Duração da mensagem de bloqueio da marcha-atrá 
+
+    unsigned long messageStartTime = 0;	// inicialização da variável 
+
+    unsigned long lastTemperatureBeepTime = 0;	// inicialização da variável que controla o intervalo entre os beeps da temperatura 
+
+    unsigned long lastDownshiftBeepTime = 0; 	// inicialização da variável que controla o intervalo entre os beeps de redução de caixa 
+
+#define DISTANCE_THRESHOLD1 50 			// thereshold 1 dos sensores ultrasónicos 
+
+#define DISTANCE_THRESHOLD2 25			// thereshold 2 dos sensores ultrasónicos 
+
+#define DISTANCE_THRESHOLD3  10  		// thereshold 3 dos sensores ultrasónicos 
+
+    float gearFactors[8] = {0.005,0,0.01, 0.015, 0.02, 0.025, 0.03, 0.035};      // fatores de simulação de relação de transmissão 
+
+    bool buzzerState = false; 	 												 // variável de controlo do estado do buzzer 
+
+    bool manualControl = false;    			// inicialização da variável de controlo manual do potenciómetro 
+
+#define BUZZER_PIN 32		// pino do buzzer 
+
+    for (;;) {		// ciclo principal da tarefa 
+
+ 
+
+ 
+
+        if (xQueueReceive(sensorDataQueue, &sensorData, portMAX_DELAY)) {			    // receção dos dados da queue de dados dos sensores 
+
+ 
+
+            if (xSemaphoreTake(reverseGearSemaphore, portMAX_DELAY)) {					// take do semáforo de bloqueio da marcha-atrás 
+
+ 
+
+                if (sensorData.switch2State == LOW) { 										// tentativa do utilizador em engrenar a marcha-atrás 
+
+                    if (processedData.gear == 0 && sensorData.rpm == 0) {					// só permite engrenar a marcha-atrás se não houver rotação e a mudança atual for neutro 
+
+                        processedData.gear = -1; // Engage reverse gear 
+
+                        tone(BUZZER_PIN, 1000, 200); // Beep indicating reverse engaged		// beep do buzzer indicativo do engreno da marcha-atrás 
+
+                    } else if (processedData.gear == 0 && sensorData.rpm > 0) { 
+
+                        showMessage = true; // Block reverse if RPM > 0						// bloqueia o engreno da marcha-atrás se houver rotação e exibe a mensagem 
+
+                        messageStartTime = millis(); 
+
+                        processedData.messageStartTime= messageStartTime; 
+
+                        tone(BUZZER_PIN, 1000, 200); 										// beep do buzzer indicativo do bloqueio de engreno da marcha-atrás 
+
+                    } 
+
+                } else if (sensorData.switch1State == LOW && processedData.gear == -1) {    // tentativa do utilizador em passar de R para N 
+
+                    processedData.gear = 0;		// engreno do neutro 
+
+                    tone(BUZZER_PIN, 800, 150); 	// beep do buzzer indicativo do engreno do neutro 
+
+                } 
+
+                xSemaphoreGive(reverseGearSemaphore);		// give do semáforo de bloqueio da marcha-atrás 
+
+            } 
+
+            if (!showMessage) { 
+
+                int predictedRPM;	// inicialização da variável de rpm previsível após a troca de mudança 
+
+ 
+
+                if (sensorData.switch1State == LOW && processedData.gear < 6) { 				// tentativa do utlizador em subir uma mudança 
+
+                    if (processedData.gear == 0) { 
+
+                        processedData.gear++;		// caso seja a troca de ponto morto para primeira, mantém-se a rotação 
+
+                        processedData.rpm = sensorData.rpm; 
+
+                        manualControl = true;	// o utlizador tem o controlo do potenciómetro 
+
+                    } else { 
+
+                        predictedRPM = processedData.rpm - 1500;								// cálculo da rpm previsível 
+
+                        if (predictedRPM > 800 && predictedRPM <= RPM_LIMIT) { 
+
+                            processedData.gear++; 
+
+                            processedData.rpm = predictedRPM;									// a troca é bloqueada caso a previsão não esteja dentro dos limites 
+
+                            manualControl = true;												// o utlizador tem o controlo do potenciómetro 
+
+                        } else { 
+
+                            tone(BUZZER_PIN, 1000, 200); // Beep for blocked shift				// beep do buzzer indicativo do bloqueio de troca de mudança 
+
+                        } 
+
+                    } 
+
+                } else if (sensorData.switch2State == LOW && processedData.gear > 0) { 			// tentativa do utlizador em descer uma mudança 
+
+                    if (processedData.gear == 1) { 
+
+                        processedData.gear = 0; 						// caso a mudança engrenada seja a primeira, deixa engrenar o Neutro 
+
+                        manualControl = true;							// habilita o controlo manual do potenciómetro 
+
+                    } else { 
+
+                        predictedRPM = processedData.rpm + 1500;			// cálculo da rpm prevista após a troca 
+
+                        if (predictedRPM > 800 && predictedRPM <= RPM_LIMIT) { 
+
+                            processedData.gear--;			// permite a troca caso a rotação prevista esteja dentro do intervalo 
+
+                            processedData.rpm = predictedRPM;			// ajusta a rotação 
+
+                            manualControl = true;			// habilita o controlo manual do potenciómetro 
+
+                        } else { 
+
+                            unsigned long currentTime = millis(); 
+
+                            if (currentTime - lastDownshiftBeepTime >= 2000) { 
+
+                                tone(BUZZER_PIN, 1000, 200); 			// beep do buzzer indicativo do bloqueio de troca para baixo 
+
+                                lastDownshiftBeepTime = currentTime; 
+
+                            } 
+
+                        } 
+
+                    } 
+
+                } 
+
+            } 
+
+ 
+
+            float simulatedVelocity = 0.0;	// inicialização da velocidade simulada a zero 
+
+            if (processedData.gear >=-1 && processedData.gear <= 6) { 
+
+                simulatedVelocity = processedData.rpm * gearFactors[processedData.gear-1]; 	// simula a velocidade através dos coeficientes de cada mudança 
+
+            } 
+
+            processedData.simulatedVelocity = simulatedVelocity; 
+
+            if (!manualControl) { 
+
+                processedData.rpm = sensorData.rpm;				// caso a rotação indicada passa a ser a rotação do potenciómetro 
+
+            } else { 
+
+                if (abs(processedData.rpm - sensorData.rpm) < 500) { 
+
+                     manualControl= false; 	// caso o desfasamento entre a velocidade do potenciómetro e a indicada seja menor que 500, devolve-se o controlo manual 
+
+                } 
+
+            } 
+
+ 
+
+            processedData.temperature = sensorData.temperature; 
+
+ 
+
+            processedData.distance1 = sensorData.distance1;			// atribui a distância medida por cada sensor a variáveis independentes 
+
+            processedData.distance2 = sensorData.distance2; 
+
+            processedData.distance3 = sensorData.distance3; 
+
+ 
+
+            if (processedData.gear == -1) {		// garante que possíveis respostas aos valores dos sensores só ocorrem em marcha-atrás 
+
+                if (processedData.distance1 < DISTANCE_THRESHOLD3 || 
+
+                    processedData.distance2 < DISTANCE_THRESHOLD3 || 
+
+                    processedData.distance3 < DISTANCE_THRESHOLD3) { 
+
+ 
+
+                    buzzerState = true; 
+
+                    tone(BUZZER_PIN, 1000);  		// ativar o buzzer continuamente caso qualquer um dos sensores leia uma distância menor que o estipulado 
+
+                } 
+
+                else if (processedData.distance1 < DISTANCE_THRESHOLD2 || 
+
+                         processedData.distance2 < DISTANCE_THRESHOLD2 || 
+
+                         processedData.distance3 < DISTANCE_THRESHOLD2) { 
+
+ 
+
+                    buzzerState = true; 
+
+    tone(BUZZER_PIN, 1000, 15); 
+
+                   			// ativar o buzzer intermitentemente caso qualquer um dos sensores leia uma distância menor que o estipulado 
+
+                } 
+
+                else if (processedData.distance1 < DISTANCE_THRESHOLD1 || 
+
+                         processedData.distance2 < DISTANCE_THRESHOLD1 || 
+
+                         processedData.distance3 < DISTANCE_THRESHOLD1) { 
+
+ 
+
+                    buzzerState = true; 
+
+                    tone(BUZZER_PIN, 1000, 100); 				// ativar beep lento do buzzer caso qualquer um dos sensores leia uma distância menor que o estipulado 
+
+                } 
+
+                else { 
+
+                    buzzerState = false; 
+
+                    noTone(BUZZER_PIN);		// desabilita o buzzer se nenhum dos limites for ultrapassado 
+
+                } 
+
+            } else { 
+
+                buzzerState = false;  		// desabilita o buzzer caso não se esteja em marcha-atrás 
+
+                noTone(BUZZER_PIN); 
+
+            } 
+
+ 
+
+ 
+
+            if (processedData.rpm >= RPM_LIMIT && !buzzerState) {		// verifica a rotação e se o buzzer já está a habilitado 
+
+                buzzerState = true; 
+
+                tone(BUZZER_PIN, 1500, 200); 		// beep do buzzer ao redline 
+
+            } 
+
+ 
+
+ 
+
+            if (processedData.temperature > TEMP_LIMIT) {			// verifica se a temperatura excedeu o limite 
+
+                unsigned long currentTime = millis();	//devolve o tempo em milissegundos desde que o processador foi ligado 
+
+                if (currentTime - lastTemperatureBeepTime >= 5000) { 	// beep do buzzer a cada 10s 
+
+                    tone(BUZZER_PIN, 1200, 300); 
+
+                    lastTemperatureBeepTime = currentTime;			// contagem do tempo entre beeps 
+
+                } 
+
+            } 
+
+ 
+
+            if (xSemaphoreTake(logicSemaphore, portMAX_DELAY)) { 
+
+            if (xQueueSend(processedDataQueue, &processedData, pdMS_TO_TICKS(200)) != pdTRUE) { 
+
+                Serial.println("Processed Data Queue is full or failed to send data");		// envio dos dados para a queue 
+
+            } 
+
+            xSemaphoreGive(logicSemaphore); 
+
+            } 
+
+ 
+
+        vTaskDelay(pdMS_TO_TICKS(50)); 
+
+}}} 
+
+ 
+
+void displayTask(void *pvParameters) {		// tarefa responsável pelo controlo do display 
+
+    ProcessedData processedData; 
+
+    tft.fillScreen(ILI9341_BLACK);		// limpa o ecrã 
+
+    desenhaLayout();		// desenha o layout 
+
+ 
+
+#define LED1 15	// Pino do led 1 
+
+#define LED2 21	// Pino do led 2 
+
+#define TEMP_LIMIT 90	// threshold da temperatura 
+
+ 
+
+    for (;;) { 
+
+        if (xQueueReceive(processedDataQueue, &processedData, portMAX_DELAY)) {			// recebe os dados da queue de dados processados 
+
+         tft.setCursor(10, 245); 
+
+        tft.setTextColor(ILI9341_WHITE); 
+
+         tft.setTextSize(2); 
+
+         tft.print("Speed: "); 
+
+         tft.fillRect(10, 275, 200, 40, ILI9341_BLACK);		// limpa a área do ecrã antes de escrever a velocidade 
+
+ 
+
+         tft.setTextSize(4); 
+
+        tft.setCursor(10, 275); 
+
+        	            tft.print(processedData.simulatedVelocity); 
+
+        tft.println(" km/h"); 
+
+ 
+
+ 
+
+         if (showMessage && (millis() - processedData.messageStartTime >= MESSAGE_DURATION)) { 
+
+        showMessage = false;	// apresenta a mensagem de erro 
+
+         tft.fillScreen(ILI9341_BLACK); 
+
+              desenhaLayout();	// volta a desenhar o layout 
+
+        } 
+
+       } 
+
+ 
+
+ 
+
+            if (showMessage) {	// apresenta a mensagem de bloqueio de engreno da marcha-atrás 
+
+                tft.fillScreen(ILI9341_BLACK); 
+
+                tft.setTextColor(ILI9341_WHITE, ILI9341_BLACK); 
+
+                tft.setTextSize(2); 
+
+                tft.setCursor((tft.width() - 300) / 2, tft.height() / 2 - 70); 
+
+                tft.print("Imobilize o veiculo"); 
+
+                tft.setCursor((tft.width() - 300) / 2, tft.height() / 2 -20); 
+
+                tft.print("antes de engrenar"); 
+
+                tft.setCursor((tft.width() - 300) / 2, tft.height() / 2 +30); 
+
+                tft.print("a marcha atras"); 
+
+ 
+
+            } else { 
+
+                if (xSemaphoreTake(displaySemaphore, portMAX_DELAY)) {		// faz o take do semáforo 
+
+ 
+
+                    tft.setTextColor(ILI9341_BLUE, ILI9341_BLACK); 
+
+                    tft.setTextSize(4); 
+
+ 
+
+                    tft.fillRect(10, 80, 100, 40, ILI9341_BLACK);  		// Limpa a área das RPM 
+
+                    tft.setCursor(10, 80); 
+
+                    tft.print(processedData.rpm); 
+
+ 
+
+                    tft.setTextColor(ILI9341_RED, ILI9341_BLACK); 
+
+                    tft.fillRect(10, 135, 130, 40, ILI9341_BLACK); 	 	// Limpa a área da temperatura 
+
+                    tft.setCursor(10, 155); 
+
+                    tft.print(processedData.temperature); 
+
+ 
+
+                    tft.setTextColor(ILI9341_WHITE, ILI9341_BLACK); 
+
+                    tft.fillRect(10, 210, 130, 40, ILI9341_BLACK);  		// Limpa a área da mudança 
+
+                    tft.setCursor(10, 210); 
+
+                    if (processedData.gear == 0) { 
+
+                        tft.setTextColor(ILI9341_GREEN, ILI9341_BLACK); 
+
+                        tft.print("N"); 
+
+                    } else if (processedData.gear == -1) { 
+
+                        tft.setTextColor(ILI9341_WHITE, ILI9341_BLACK); 
+
+                        tft.print("R"); 
+
+                    } else { 
+
+                        tft.print(processedData.gear);			// apresenta a mudança engrenada 
+
+                    } 
+
+ 
+
+ 
+
+                    int barraRPMHeight = map(processedData.rpm, 0, RPM_LIMIT, 0, 200); 
+
+                    int barraTempHeight = map(processedData.temperature, 0, TEMP_LIMIT, 0, 200); 
+
+                    int barX1 = 150, barY1 = 75, barX2 = barX1 + 40; 
+
+ 
+
+                    tft.fillRect(barX1, barY1, 30, 200, ILI9341_BLACK);  // Limpar barra RPM 
+
+                    tft.fillRect(barX1, barY1 + 200 - barraRPMHeight, 30, barraRPMHeight, ILI9341_BLUE);  // Atualiza a  barra das RPM 
+
+ 
+
+                    tft.fillRect(barX2, barY1, 30, 200, ILI9341_BLACK);  // Limpar barra temperatura 
+
+                    tft.fillRect(barX2, barY1 + 200 - barraTempHeight, 30, barraTempHeight, ILI9341_RED);  // Atualiza a barra da temperatura 
+
+ 
+
+ 
+
+                    barraLEDs(processedData.rpm);   // atualiza a barra de leds simulada 
+
+ 
+
+ 
+
+                    digitalWrite(LED1, processedData.rpm > 6000 ? HIGH : LOW); 
+
+                    digitalWrite(LED2, processedData.temperature > TEMP_LIMIT ? HIGH : LOW);	// atualização dos leds reais 
+
+                    digitalWrite(BUZZER_PIN, processedData.rpm >= RPM_LIMIT ? HIGH : LOW);	// atualização do buzzer 
+
+ 
+
+                    xSemaphoreGive(displaySemaphore);  // give do semáforo 
+
+                } 
+
+            } 
+
+        } 
+
+ 
+
+        vTaskDelay(pdMS_TO_TICKS(100));  // Taxa de atualização do ecrã 
+
+    } 
+
+ 
+
+ 
+
+ 
+
+ 
+
+void setup() { 
+
+    Serial.begin(115200); 
+
+    tft.begin(); 
+
+    tft.setRotation(1);		// inicialização do ecrã 
+
+#define LED1 15		 // Pino do led 1 
+
+#define LED2 21		// Pino do led 2 
+
+#define SW1 25		// pino do botão 1 
+
+#define SW2 33		// pino do botão 2 
+
+#define TRIGGER_PIN1 12		// pino do sensor ultrassónico 1 
+
+#define ECHO_PIN1 14		// pino do sensor ultrassónico 1 
+
+#define TRIGGER_PIN2 27 		// pino do sensor ultrassónico 2 
+
+#define ECHO_PIN2 26		// pino do sensor ultrassónico 2 
+
+#define TRIGGER_PIN3 16		// pino do sensor ultrassónico 3 
+
+#define ECHO_PIN3 17 		// pino do sensor ultrassónico 3 
+
+#define BUZZER_PIN 32		// pino do buzzer 
+
+ 
+
+    pinMode(BUZZER_PIN, OUTPUT);	// inicialização do pino do buzzer como saída 
+
+    pinMode(SW1, INPUT_PULLUP);		// inicialização do pino do botão 1 como entrada e resistência pull up interna 
+
+    pinMode(SW2, INPUT_PULLUP);		// inicialização do pino do botão 2 como entrada e resistência pull up interna 
+
+    pinMode(LED1, OUTPUT);		// inicialização do pino do led 1 como saída 
+
+    pinMode(LED2, OUTPUT);		// inicialização do pino do led 2 como saída 
+
+    pinMode(TRIGGER_PIN1, OUTPUT);	// inicialização do pino trigger do sensor de ultrassons 1 como saída 
+
+    pinMode(ECHO_PIN1,INPUT);		// inicialização do pino echo do sensor de ultrassons 1 como saída 
+
+    pinMode (TRIGGER_PIN2,OUTPUT);	// inicialização do pino trigger do sensor de ultrassons 2 como saída 
+
+    pinMode(ECHO_PIN2,INPUT);		// inicialização do pino echo do sensor de ultrassons 2 como saída 
+
+    pinMode (TRIGGER_PIN3,OUTPUT);	// inicialização do pino trigger do sensor de ultrassons 3 como saída 
+
+    pinMode(ECHO_PIN3,INPUT);      // inicialização do pino echo do sensor de ultrassons 3 como saída 
+
+ 
+
+ 
+
+ 
+
+    digitalWrite(LED1, LOW);	// estado inicial do led 1 desligado 
+
+    digitalWrite(LED2, LOW);	// estado inicial do led 2 desligado 
+
+ 
+
+ 
+
+    sensorDataQueue = xQueueCreate(5, sizeof(SensorData)); 
+
+    processedDataQueue = xQueueCreate(5, sizeof(ProcessedData));	// criação das queues 
+
+ 
+
+ 
+
+    displaySemaphore = xSemaphoreCreateMutex(); 
+
+    sensorSemaphore = xSemaphoreCreateMutex(); 
+
+    logicSemaphore = xSemaphoreCreateMutex(); 
+
+    reverseGearSemaphore = xSemaphoreCreateMutex();  		// criação dos semáforos 
+
+ 
+
+    xTaskCreate(TaskSensores, "SensorTask", 4096, NULL, 2, NULL); 
+
+    xTaskCreate(TaskLogica, "LogicTask", 4096, NULL, 2, NULL); 
+
+    xTaskCreate(displayTask, "DisplayTask", 4096, NULL, 3, NULL);	// criação das tarefas 
+
+} 
+
+ 
+
+void loop() { 
+
+vTaskDelete(NULL);		// o loop mata-se a ele mesmo, o FreeRTOS gere as tarefas 
+
+} 
